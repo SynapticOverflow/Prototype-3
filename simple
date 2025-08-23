@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+gm2_genz5294_model_fixed.py
+Fixed version of the GM2 gangliosidosis simulation model
+"""
+
+import os
+import sys
+import math
+import json
+import random
+import logging
+import argparse
+from typing import Dict, Tuple, List, Optional, Any
+
+import numpy as np
+import pandas as pd
+from scipy.integrate import solve_ivp
+from scipy.optimize import least_squares
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Configure seaborn for nicer visuals
+sns.set_style('whitegrid')
+sns.set_context('talk')
+
+# Global logging configuration
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logger = logging.getLogger("GM2Model")
+
+# Utility functions
+def ensure_dir(path: str):
+    """Ensure a directory exists."""
+    os.makedirs(path, exist_ok=True)
+
+def clamp(x, lo, hi):
+    """Clamp a numeric value between lo and hi."""
+    return max(lo, min(hi, x))
+
+def um_to_ng_per_ml(micromolar: float, mw_g_per_mol: float) -> float:
+    """Convert concentration µM to ng/mL using molecular weight."""
+    return micromolar * mw_g_per_mol
+
+# Drug library with real literature-based parameters
+class DrugLibrary:
+    """Registry of drug parameters based on literature values."""
+    
+    def __init__(self, default_weight_kg=70.0):
+        self.default_weight_kg = default_weight_kg
+        self.registry = {}
+        self._populate_defaults()
+
+    def _populate_defaults(self):
+        # Miglustat - Based on clinical studies
+        self.registry['miglustat'] = {
+            'dose_mg': 100.0,
+            'F': 0.97,
+            'ka_per_day': 24.0 * 2.1,
+            'ke_per_day': 24.0 * (math.log(2) / 6.5),
+            'Vd_L': 83.0,
+            'bbb_ratio': 0.20,
+            'ic50_gcs_ngmL': 20000.0,
+            'ic50_gba2_ngmL': 1e6,
+            'mw_g_per_mol': 219.2,
+            'name': 'Miglustat (Zavesca)'
+        }
+        
+        # Eliglustat
+        self.registry['eliglustat'] = {
+            'dose_mg': 84.0,
+            'F': 0.85,
+            'ka_per_day': 24.0 * 0.67,
+            'ke_per_day': 24.0 * (math.log(2) / 8.9),
+            'Vd_L': 835.0,
+            'bbb_ratio': 0.05,
+            'ic50_gcs_ngmL': 15000.0,
+            'ic50_gba2_ngmL': 1e6,
+            'mw_g_per_mol': 491.5,
+            'name': 'Eliglustat (Cerdelga)'
+        }
+        
+        # Genz-529468
+        self.registry['genz529468'] = {
+            'dose_mg': 15.0,
+            'F': 0.85,
+            'ka_per_day': 24.0 * 2.5,
+            'ke_per_day': 24.0 * 0.092,
+            'Vd_L': 1.2 * self.default_weight_kg,
+            'bbb_ratio': 0.45,
+            'ic50_gcs_ngmL': um_to_ng_per_ml(0.8, 400.0),
+            'ic50_gba2_ngmL': um_to_ng_per_ml(1.5, 400.0),
+            'mw_g_per_mol': 400.0,
+            'name': 'Genz-529468'
+        }
+
+    def get(self, key: str) -> Dict[str, Any]:
+        key = key.lower()
+        if key not in self.registry:
+            raise KeyError(f"Drug '{key}' not found. Available: {list(self.registry.keys())}")
+        return dict(self.registry[key])
+
+    def add_custom(self, key: str, params: Dict[str, Any]):
+        self.registry[key.lower()] = params
+
+# Disease parameter sets
+class DiseaseCatalog:
+    """Container for disease-specific parameters."""
+    
+    def __init__(self):
+        self.catalog = {}
+        self._populate()
+
+    def _populate(self):
+        # Sandhoff disease
+        self.catalog['sandhoff'] = {
+            'baseline_gm2_brain': 1450.0,
+            'gm2_synthesis_rate': 2.8,
+            'gm2_km': 85.0,
+            'residual_hexa': 0.018,
+            'residual_hexb': 0.0,
+            'neuroinflam_threshold': 800.0,
+            'neuronal_death_threshold': 1200.0,
+            'natural_mortality_rate': 0.30
+        }
+        
+        # Tay-Sachs disease
+        self.catalog['tay-sachs'] = {
+            'baseline_gm2_brain': 890.0,
+            'gm2_synthesis_rate': 2.3,
+            'gm2_km': 75.0,
+            'residual_hexa': 0.0,
+            'residual_hexb': 0.85,
+            'neuroinflam_threshold': 650.0,
+            'neuronal_death_threshold': 1000.0,
+            'natural_mortality_rate': 0.25
+        }
+        
+        # Late-onset GM2
+        self.catalog['late-onset'] = {
+            'baseline_gm2_brain': 420.0,
+            'gm2_synthesis_rate': 2.0,
+            'gm2_km': 65.0,
+            'residual_hexa': 0.05,
+            'residual_hexb': 0.90,
+            'neuroinflam_threshold': 350.0,
+            'neuronal_death_threshold': 550.0,
+            'natural_mortality_rate': 0.10
+        }
+
+    def get(self, disease: str) -> Dict[str, Any]:
+        disease = disease.lower()
+        if disease not in self.catalog:
+            raise KeyError(f"Disease '{disease}' not known. Available: {list(self.catalog.keys())}")
+        return dict(self.catalog[disease])
+
+# Core modeling classes
+class OneCompartmentOralPK:
+    """One-compartment oral absorption model with brain distribution."""
+    
+    def __init__(self, drug_params: Dict[str, Any], weight_kg: float = 70.0, kpb=0.8):
+        self.drug = dict(drug_params)
+        self.weight_kg = weight_kg
+        self.kpb = float(kpb)
+        
+        # Ensure numeric types
+        for k, v in self.drug.items():
+            if isinstance(v, (int, float)):
+                self.drug[k] = float(v)
+
+    def rhs(self, t: float, state: np.ndarray, dose_input_mg: float) -> np.ndarray:
+        """Compute derivatives for [A_abs, Cp, Cb] at time t."""
+        A_abs, Cp, Cb = state
+        ka = self.drug['ka_per_day']
+        ke = self.drug['ke_per_day']
+        F = self.drug['F']
+        Vd = self.drug['Vd_L']
+
+        # Absorption with dose input
+        dA_dt = dose_input_mg - ka * A_abs
+
+        # Plasma concentration changes
+        absorbed_ng_per_day = ka * A_abs * 1.0e6  # mg -> ng
+        Vd_mL = Vd * 1000.0
+        Cp_increase = (F * absorbed_ng_per_day) / Vd_mL
+        dCp_dt = Cp_increase - ke * Cp
+
+        # Brain kinetics
+        kpb = self.kpb
+        bbb = max(self.drug.get('bbb_ratio', 0.2), 1e-6)
+        
+        brain_uptake = kpb * Cp / (1.0 + Cp / 1000.0)
+        brain_efflux = 0.15 * Cb
+        brain_equilibrium = 0.1 * (Cp * bbb - Cb)
+        
+        dCb_dt = brain_uptake + brain_equilibrium - brain_efflux
+
+        return np.array([dA_dt, dCp_dt, dCb_dt], dtype=float)
+
+class GM2PDModel:
+    """Pharmacodynamic model incorporating real mechanisms."""
+    
+    def __init__(self, disease_params: Dict[str, Any]):
+        self.dp = dict(disease_params)
+
+    def gcs_inhibition_fraction(self, Cb_ngmL: float, ic50_ngmL: float, hill_n: float = 1.2) -> float:
+        """Hill equation for competitive inhibition."""
+        if ic50_ngmL <= 0:
+            return 0.0
+        num = (Cb_ngmL ** hill_n)
+        den = (Cb_ngmL ** hill_n) + (ic50_ngmL ** hill_n)
+        frac = num / den if den > 0 else 0.0
+        return clamp(float(frac), 0.0, 0.95)
+
+    def gm2_synthesis_reduction(self, baseline_synth: float, inhibition_frac: float, 
+                               max_reduction_frac: float = 0.75) -> float:
+        """GM2 synthesis rate reduction due to GCS inhibition."""
+        return baseline_synth * (1.0 - max_reduction_frac * clamp(inhibition_frac, 0.0, 1.0))
+
+    def gm2_clearance_michaelis(self, gm2_conc: float, enzyme_fraction: float, 
+                               vmax_norm: float = 15.0) -> float:
+        """Michaelis-Menten GM2 clearance."""
+        vmax = vmax_norm * clamp(enzyme_fraction, 0.0, 1.0)
+        km = self.dp.get('gm2_km', 80.0)
+        return (vmax * gm2_conc) / (km + gm2_conc) if (km + gm2_conc) > 0 else 0.0
+
+class AAVModule:
+    """AAV gene therapy module with realistic kinetics."""
+    
+    def __init__(self,
+                 dose_vg: float = 1.2e13,
+                 onset_days: float = 21.0,
+                 peak_days: float = 90.0,
+                 max_restore_fraction: float = 0.25,
+                 transduction_efficiency: float = 0.18,
+                 duration_days: float = 730.0,
+                 immune_clearance_rate: float = 0.0008):
+        self.dose_vg = dose_vg
+        self.onset_days = onset_days
+        self.peak_days = peak_days
+        self.max_restore_fraction = max_restore_fraction
+        self.transduction_efficiency = transduction_efficiency
+        self.duration_days = duration_days
+        self.immune_clearance_rate = immune_clearance_rate
+
+    def enzyme_fraction_boost(self, t_days: float) -> float:
+        """Enzyme restoration kinetics with immune-mediated decline."""
+        if t_days < self.onset_days:
+            return 0.0
+        elif t_days < self.peak_days:
+            # Sigmoid ramp-up
+            progress = (t_days - self.onset_days) / (self.peak_days - self.onset_days)
+            sigmoid_val = 1.0 / (1.0 + math.exp(-8.0 * (progress - 0.5)))
+            return float(self.max_restore_fraction * sigmoid_val)
+        elif t_days <= self.duration_days:
+            # Plateau with slow decline
+            decline = math.exp(-self.immune_clearance_rate * (t_days - self.peak_days))
+            return float(self.max_restore_fraction * decline)
+        else:
+            # Long-term exponential decay
+            late_decay = math.exp(-0.002 * (t_days - self.duration_days))
+            return float(self.max_restore_fraction * 0.1 * late_decay)
+
+class DiseaseProgressionModel:
+    """Integrated disease progression model."""
+    
+    def __init__(self,
+                 disease_params: Dict[str, Any],
+                 drug_params: Dict[str, Any],
+                 aav_module: Optional[AAVModule] = None,
+                 stochastic: bool = False,
+                 rng_seed: Optional[int] = None):
+        self.dp = dict(disease_params)
+        self.drug = dict(drug_params)
+        self.aav = aav_module
+        self.stochastic = bool(stochastic)
+        
+        if rng_seed is not None:
+            self.rng = np.random.default_rng(rng_seed)
+        else:
+            self.rng = np.random.default_rng()
+
+        # Component models
+        self.pk = OneCompartmentOralPK(self.drug)
+        self.pd = GM2PDModel(self.dp)
+
+        # Pathophysiology constants
+        self.lysosomal_clearance_rate = 0.015
+        self.microglial_activation_threshold = 0.7
+        self.neuronal_death_rate_max = 0.08
+        self.synaptic_dysfunction_factor = 0.12
+
+    def initial_state(self) -> np.ndarray:
+        """Initial conditions."""
+        GM2b0 = float(self.dp.get('baseline_gm2_brain', 1000.0))
+        residual_hexa = float(self.dp.get('residual_hexa', 0.0))
+        residual_hexb = float(self.dp.get('residual_hexb', 0.0))
+        
+        enzyme_frac0 = residual_hexa + 0.15 * residual_hexb
+        
+        initial_inflammation = 0.4 if GM2b0 > 800 else 0.2
+        initial_health = 0.6 if GM2b0 < 600 else 0.3
+        
+        return np.array([
+            0.0,                # A_abs (mg)
+            0.0,                # Cp (ng/mL)
+            0.0,                # Cb (ng/mL)
+            GM2b0,              # GM2 brain µg/g
+            enzyme_frac0,       # enzyme fraction
+            initial_inflammation, # inflammation index
+            initial_health,     # neuronal health
+            1.0                 # survival prob
+        ], dtype=float)
+
+    def _dynamics(self, t_days: float, state: np.ndarray, 
+                  dosing: Tuple[float, float, float]) -> np.ndarray:
+        """System dynamics."""
+        A_abs, Cp, Cb, GM2b, enzyme_frac, inflam, health, surv = state
+
+        # Dosing logic
+        dose_mg, interval_h, start_day = dosing
+        interval_d = interval_h / 24.0
+        dose_input = 0.0
+        if t_days >= start_day and dose_mg > 0:
+            # Simple dosing at regular intervals
+            time_since_start = t_days - start_day
+            n_doses = int(time_since_start / interval_d)
+            next_dose_time = start_day + n_doses * interval_d
+            if abs(t_days - next_dose_time) < 0.01:  # Within 0.01 days of dose time
+                dose_input = dose_mg
+
+        # Add inter-subject variability
+        if self.stochastic and dose_input > 0:
+            dose_input *= float(self.rng.normal(1.0, 0.08))
+
+        # PK dynamics
+        pk_derivs = self.pk.rhs(t_days, np.array([A_abs, Cp, Cb]), dose_input)
+        dA_dt, dCp_dt, dCb_dt = pk_derivs
+
+        # PD: inhibition calculations
+        ic50_gcs = float(self.drug.get('ic50_gcs_ngmL', 100.0))
+        ic50_gba2 = float(self.drug.get('ic50_gba2_ngmL', 1e9))
+        gcs_inhibition = self.pd.gcs_inhibition_fraction(Cb, ic50_gcs)
+        gba2_inhibition = self.pd.gcs_inhibition_fraction(Cb, ic50_gba2)
+
+        # Stochastic PD variability
+        if self.stochastic:
+            gcs_inhibition *= float(self.rng.normal(1.0, 0.05))
+            gba2_inhibition *= float(self.rng.normal(1.0, 0.08))
+            gcs_inhibition = clamp(gcs_inhibition, 0.0, 0.95)
+            gba2_inhibition = clamp(gba2_inhibition, 0.0, 0.95)
+
+        # GM2 synthesis and clearance
+        synth_rate = self.pd.gm2_synthesis_reduction(
+            float(self.dp['gm2_synthesis_rate']), gcs_inhibition
+        )
+
+        # AAV enzyme restoration
+        aav_boost = 0.0
+        if self.aav is not None:
+            aav_boost = self.aav.enzyme_fraction_boost(t_days)
+        
+        total_enzyme = clamp(enzyme_frac + aav_boost, 0.0, 1.0)
+        gm2_clearance = self.pd.gm2_clearance_michaelis(GM2b, total_enzyme)
+
+        # GM2 dynamics
+        dGM2_dt = synth_rate - gm2_clearance - (self.lysosomal_clearance_rate * GM2b)
+
+        # Neuroinflammation
+        gm2_trigger = max(0.0, (GM2b - self.dp['neuroinflam_threshold']) / 
+                         max(1.0, self.dp['neuronal_death_threshold']))
+        gba2_inflammatory_effect = 0.03 * gba2_inhibition
+        treatment_anti_inflam = 0.06 * gcs_inhibition
+        
+        dInflam_dt = (0.4 * gm2_trigger + gba2_inflammatory_effect - 
+                     0.12 * inflam - treatment_anti_inflam)
+
+        # Neuronal health dynamics
+        gm2_toxicity = 0.001 * GM2b + 0.0005 * GM2b * inflam
+        synaptic_damage = self.synaptic_dysfunction_factor * max(0, GM2b - 400)
+        inflammatory_damage = 0.18 * inflam
+        
+        enzyme_protection = 0.03 * total_enzyme
+        drug_neuroprotection = 0.04 * gcs_inhibition
+        
+        total_damage = gm2_toxicity + synaptic_damage + inflammatory_damage
+        total_protection = enzyme_protection + drug_neuroprotection
+        
+        dHealth_dt = -total_damage + total_protection
+        dHealth_dt = clamp(dHealth_dt, -self.neuronal_death_rate_max, 0.06)
+
+        # Survival probability
+        baseline_hazard = self.dp.get('natural_mortality_rate', 0.25) / 365.0
+        gm2_hazard = 0.00003 * max(0.0, GM2b - self.dp['gm2_km'])
+        inflam_hazard = 0.003 * clamp(inflam, 0.0, 3.0)
+        health_hazard = 0.005 * max(0.0, 0.2 - health)
+        
+        total_hazard = baseline_hazard + gm2_hazard + inflam_hazard + health_hazard
+        dSurv_dt = -total_hazard * surv
+
+        # Enzyme fraction equilibration
+        target_enzyme = clamp(
+            self.dp.get('residual_hexa', 0.0) + 0.15 * self.dp.get('residual_hexb', 0.0) + aav_boost,
+            0.0, 1.0
+        )
+        dEnzyme_dt = (target_enzyme - enzyme_frac) * 0.08
+
+        return np.array([dA_dt, dCp_dt, dCb_dt, dGM2_dt, dEnzyme_dt, 
+                        dInflam_dt, dHealth_dt, dSurv_dt], dtype=float)
+
+# Simulation orchestration
+class Simulator:
+    """Enhanced simulator with clinical outcome modeling."""
+    
+    def __init__(self, drug_library: DrugLibrary, disease_catalog: DiseaseCatalog, 
+                 outdir: str = "results"):
+        self.drug_library = drug_library
+        self.disease_catalog = disease_catalog
+        self.outdir = outdir
+        ensure_dir(self.outdir)
+
+    def run_single(self,
+                   disease_name: str,
+                   drug_name: str,
+                   duration_days: float = 365.0,
+                   dose_mg: Optional[float] = None,
+                   dose_interval_h: float = 12.0,
+                   dose_start_day: float = 0.0,
+                   use_aav: bool = True,
+                   stochastic: bool = False,
+                   rng_seed: Optional[int] = None,
+                   t_eval_per_day: int = 2) -> pd.DataFrame:
+        """Run single simulation."""
+        
+        logger.info(f"Running: {disease_name} + {drug_name}, {duration_days}d")
+
+        # Get parameters
+        disease_params = self.disease_catalog.get(disease_name)
+        drug_params = self.drug_library.get(drug_name)
+        if dose_mg is not None:
+            drug_params = dict(drug_params)
+            drug_params['dose_mg'] = float(dose_mg)
+
+        # AAV setup
+        aav_module = AAVModule() if use_aav else None
+
+        # Create model
+        prog_model = DiseaseProgressionModel(
+            disease_params=disease_params,
+            drug_params=drug_params,
+            aav_module=aav_module,
+            stochastic=stochastic,
+            rng_seed=rng_seed
+        )
+
+        # Initial conditions and time grid
+        y0 = prog_model.initial_state()
+        t_span = (0.0, float(duration_days))
+        N = max(10, int(duration_days * t_eval_per_day) + 1)
+        t_eval = np.linspace(t_span[0], t_span[1], N)
+
+        # Dosing
+        dosing = (float(drug_params.get('dose_mg', 15.0)), float(dose_interval_h), 
+                 float(dose_start_day))
+
+        # Solve ODE
+        def ode_fun(t, y):
+            return prog_model._dynamics(t, y, dosing)
+
+        try:
+            sol = solve_ivp(fun=ode_fun, t_span=t_span, y0=y0, t_eval=t_eval, 
+                           method='LSODA', rtol=1e-7, atol=1e-9)
+        except Exception as e:
+            logger.error(f"ODE integration failed: {e}")
+            raise
+
+        if not sol.success:
+            logger.error(f"ODE solver failed: {sol.message}")
+            raise RuntimeError(f"ODE integration failed: {sol.message}")
+
+        # Build results DataFrame
+        df = pd.DataFrame({
+            'time_days': sol.t,
+            'time_months': sol.t / 30.44,
+            'A_abs_mg': sol.y[0, :],
+            'Cp_ngmL': sol.y[1, :],
+            'Cb_ngmL': sol.y[2, :],
+            'GM2_brain_ug_g': sol.y[3, :],
+            'enzyme_frac': sol.y[4, :],
+            'inflammation': sol.y[5, :],
+            'neuronal_health': sol.y[6, :],
+            'survival_prob': np.clip(sol.y[7, :], 0.0, 1.0)
+        })
+
+        # Clinical endpoints
+        baseline = float(disease_params['baseline_gm2_brain'])
+        df['GM2_reduction_pct'] = (baseline - df['GM2_brain_ug_g']) / baseline * 100.0
+        
+        # Motor function score
+        df['motor_score'] = 100 * np.clip(
+            df['neuronal_health'] * (1.0 - 0.4 * df['inflammation']), 0.0, 1.0
+        )
+        
+        # Developmental quotient proxy
+        df['development_score'] = 100 * np.clip(
+            df['neuronal_health'] * (1.0 - 0.3 * np.maximum(0, df['GM2_brain_ug_g'] - 600) / 1000), 
+            0.0, 1.0
+        )
+        
+        # Clinical seizure risk
+        df['seizure_risk'] = np.clip(
+            0.1 + 0.8 * np.maximum(0, df['GM2_brain_ug_g'] - 800) / 1000 + 0.2 * df['inflammation'], 
+            0.0, 1.0
+        )
+
+        # Save results
+        fname = (f"{disease_name}_{drug_name}_d{int(duration_days)}_"
+                f"dose{int(dosing[0])}mg_q{int(dosing[1])}h_"
+                f"aav{int(use_aav)}_stoch{int(stochastic)}.csv")
+        path = os.path.join(self.outdir, fname)
+        df.to_csv(path, index=False)
+        logger.info(f"Results saved: {path}")
+
+        return df
+
+# Simple test function
+def run_basic_tests():
+    """Run basic functionality tests."""
+    
+    print("Running basic model validation tests...")
+    
+    try:
+        # Test 1: Basic initialization
+        drug_lib = DrugLibrary()
+        disease_cat = DiseaseCatalog()
+        simulator = Simulator(drug_lib, disease_cat, outdir="test_results")
+        
+        # Test 2: Drug library access
+        genz_params = drug_lib.get('genz529468')
+        assert genz_params['name'] == 'Genz-529468'
+        assert genz_params['bbb_ratio'] > 0.4
+        print("✓ Drug library test passed")
+        
+        # Test 3: Disease catalog access
+        sandhoff_params = disease_cat.get('sandhoff')
+        assert sandhoff_params['baseline_gm2_brain'] > 1000
+        print("✓ Disease catalog test passed")
+        
+        # Test 4: Short simulation run
+        df = simulator.run_single('sandhoff', 'genz529468', duration_days=30.0, 
+                                 dose_mg=15.0, use_aav=False, stochastic=False)
+        assert len(df) > 10
+        assert 'motor_score' in df.columns
+        assert df['motor_score'].iloc[0] >= 0
+        print("✓ Basic simulation test passed")
+        
+        print("All basic tests passed! Model appears to be functioning correctly.")
+        return True
+        
+    except Exception as e:
+        print(f"✗ Test failed: {e}")
+        return False
+
+# Main execution with simple interface
+def main():
+    """Main execution function with basic functionality."""
+    
+    if len(sys.argv) > 1 and sys.argv[1] == 'test':
+        return run_basic_tests()
+    
+    print("GM2 Gangliosidosis Simulation Model (Fixed Version)")
+    print("=" * 50)
+    
+    # Initialize components
+    drug_lib = DrugLibrary()
+    disease_cat = DiseaseCatalog()
+    simulator = Simulator(drug_lib, disease_cat, outdir="gm2_results")
+    
+    # Run example simulation
+    print("Running example simulation...")
+    
+    try:
+        df = simulator.run_single(
+            disease_name='sandhoff',
+            drug_name='genz529468',
+            duration_days=180.0,
+            dose_mg=15.0,
+            use_aav=True,
+            stochastic=False
+        )
+        
+        print(f"Simulation completed successfully!")
+        print(f"Final motor score: {df['motor_score'].iloc[-1]:.1f}")
+        print(f"Final survival probability: {df['survival_prob'].iloc[-1]:.3f}")
+        print(f"GM2 reduction: {df['GM2_reduction_pct'].iloc[-1]:.1f}%")
+        
+    except Exception as e:
+        print(f"Simulation failed: {e}")
+        return False
+    
+    return True
+
+if __name__ == '__main__':
+    main()
